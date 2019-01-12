@@ -1,3 +1,3 @@
 all: build
 build:
-	nvcc main.cu -o main -I ../lib
+	nvcc main.cu -o main -I ./lib
