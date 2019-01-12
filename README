@@ -6,5 +6,9 @@ I'm using CUDA to parallelize each rays.
 
 ## Navigating source
 Each branch in this repo incrementally adds new features to the ray tracer, and adds functionality like shading, reflection, material properties, etc.
-
 For example, branch sphere is the initial version where I am writing some framework to render a sphere (it's a 3D sphere but doesn't look like it).
+
+
+This branch:
+ - Write a simple CUDA kernel that returns a pixel
+ - The pixels are written to a PPM file
