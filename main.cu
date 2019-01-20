@@ -127,9 +127,9 @@ __device__ vec3 surface_color(scene *scene, hit_info *hit)
     vec3 normal = hit->obj->normal(hit->hit_point);
     vec3 light_ray = unit_vector(scene->light.position - hit->hit_point); // vec(AB) = B - A
 
+    // Use ambient + lambertian shading model: L = ka * Ia + kd * I * max(0, n.l)
     vec3 color = scene->ambient.intensity * hit->obj->m.color + hit->obj->m.color * scene->light.intensity * fmaxf(0, dot(normal, light_ray));
-
-    return vec3(fminf(color.r(), 255), fminf(color.g(), 255), fminf(color.b(), 255));
+    return color;
 }
 
 __global__ void compute_pixel_color(vec2* data, vec3* frame_buffer, scene *sc)
@@ -186,6 +186,10 @@ __global__ void compute_pixel_color(vec2* data, vec3* frame_buffer, scene *sc)
     }
 }
 
+int normalize_color(float val)
+{
+    return static_cast<int>(std::min(val, 1.0f) * 65535);
+}
 
 int main(void)
 {
@@ -216,14 +220,14 @@ int main(void)
     cudaMallocManaged(&spheres, num_objects * sizeof(sphere));
 
     spheres[0] = sphere(vec3(-4, 0, -10), 1.2);
-    spheres[0].m.color = vec3(220, 0, 0);
+    spheres[0].m.color = vec3(0.9, 0, 0);
 
     spheres[1] = sphere(vec3(3, 0, -10), 1.4);
-    spheres[1].m.color = vec3(0, 220, 0);
+    spheres[1].m.color = vec3(0, 0.9, 0);
 
     // This sphere is slightly hidden behind the 2nd sphere
     spheres[2] = sphere(vec3(2, 0, -12), 1.5);
-    spheres[2].m.color = vec3(0, 0, 220);
+    spheres[2].m.color = vec3(0, 0, 0.9);
 
     image_plane image;
     image.l = -4; image.r = 4;
@@ -233,7 +237,7 @@ int main(void)
 
     scene *sc;
     cudaMallocManaged(&sc, sizeof(scene));
-    sc->background = vec3(120, 120, 120);
+    sc->background = vec3(0.4, 0.4, 0.4);
     sc->world = spheres;
     sc->num_objects = num_objects;
     sc->camera = vec3(0, 0, 0);
@@ -242,8 +246,8 @@ int main(void)
     sc->light.position = vec3(-6, 4, -4);
     // Limiting the intensity of lights for now because of PPM being configured to have
     // a max value of 255 for a pixel color (else the values would exceed 255)
-    sc->light.intensity = vec3(1, 1, 1);
-    sc->ambient.intensity = vec3(0.06, 0.06, 0.06);
+    sc->light.intensity = vec3(0.9, 0.9, 0.9);
+    sc->ambient.intensity = vec3(0.1, 0.1, 0.1);
 
     compute_pixel_color<<<num_blocks, threads_per_block>>>(data, frame_buffer, sc);
     cudaDeviceSynchronize();
@@ -255,10 +259,11 @@ int main(void)
         return 0;
     }
 
-    std::cout << "P3\n" << nx << " " << ny << "\n255\n";
+    std::cout << "P3\n" << nx << " " << ny << "\n65535\n";
     for (int i = 0; i < num_pixels; ++i)
     {
-        std::cout << static_cast<int>(frame_buffer[i].r()) << " " << static_cast<int>(frame_buffer[i].g()) << " " << static_cast<int>(frame_buffer[i].b()) << "\n";
+        //std::cout << static_cast<int>(frame_buffer[i].r() * 65536) << " " << static_cast<int>(frame_buffer[i].g() * 65536) << " " << static_cast<int>(frame_buffer[i].b() * 65536) << "\n";
+        std::cout << normalize_color(frame_buffer[i].r()) << " " << normalize_color(frame_buffer[i].g()) << " " << normalize_color(frame_buffer[i].b()) << "\n";
     }
 
     cudaFree(spheres);
