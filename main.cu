@@ -3,6 +3,12 @@
 #include <iostream>
 #include <cmath>
 
+#include <thrust/device_ptr.h>
+#include <thrust/extrema.h>
+#include <thrust/functional.h>
+#include <thrust/transform_reduce.h>
+
+
 #include "vec3.h"
 
 // Mathematics obtained from Fundamentals of Computer Graphics (3rd edition) book
@@ -186,10 +192,31 @@ __global__ void compute_pixel_color(vec2* data, vec3* frame_buffer, scene *sc)
     }
 }
 
-int normalize_color(float val)
+
+// Unary reduction op to get the max value of either r/g/b
+struct max_color
 {
-    return static_cast<int>(std::min(val, 1.0f) * 65535);
-}
+    __host__ __device__
+    float operator()(const vec3& v)
+    {
+        return thrust::max(thrust::max(v.r(), v.g()), v.b());
+    }
+
+};
+
+
+// Normalizer to normalize samples down to [0, 1] and then scale
+struct normalize_color
+{
+    const float normalizer, scale;
+
+    normalize_color(float _normalizer, int _scale): normalizer(_normalizer), scale(_scale) {}
+
+    int operator()(const float &val) const
+    {
+        return static_cast<int>(val/normalizer * scale);
+    }
+};
 
 int main(void)
 {
@@ -244,10 +271,8 @@ int main(void)
     sc->image = image;
 
     sc->light.position = vec3(-6, 4, -4);
-    // Limiting the intensity of lights for now because of PPM being configured to have
-    // a max value of 255 for a pixel color (else the values would exceed 255)
-    sc->light.intensity = vec3(0.9, 0.9, 0.9);
-    sc->ambient.intensity = vec3(0.1, 0.1, 0.1);
+    sc->light.intensity = vec3(1, 1, 1);
+    sc->ambient.intensity = vec3(0.3, 0.3, 0.3);
 
     compute_pixel_color<<<num_blocks, threads_per_block>>>(data, frame_buffer, sc);
     cudaDeviceSynchronize();
@@ -259,11 +284,17 @@ int main(void)
         return 0;
     }
 
-    std::cout << "P3\n" << nx << " " << ny << "\n65535\n";
+    // Scale all color values to [0, 1]
+    thrust::device_ptr<vec3> dev_frame_buffer_begin(frame_buffer), dev_frame_buffer_end(frame_buffer + num_pixels);
+    float normalizer = thrust::transform_reduce(dev_frame_buffer_begin, dev_frame_buffer_end, max_color(), 0.0f, thrust::maximum<float>());
+
+    int max_color_value = (2 << 15) - 1;  // The max color value for a PPM file
+    normalize_color normalize(normalizer, max_color_value);
+
+    std::cout << "P3\n" << nx << " " << ny << "\n" << max_color_value << "\n";
     for (int i = 0; i < num_pixels; ++i)
     {
-        //std::cout << static_cast<int>(frame_buffer[i].r() * 65536) << " " << static_cast<int>(frame_buffer[i].g() * 65536) << " " << static_cast<int>(frame_buffer[i].b() * 65536) << "\n";
-        std::cout << normalize_color(frame_buffer[i].r()) << " " << normalize_color(frame_buffer[i].g()) << " " << normalize_color(frame_buffer[i].b()) << "\n";
+        std::cout << normalize(frame_buffer[i].r()) << " " << normalize(frame_buffer[i].g()) << " " << normalize(frame_buffer[i].b()) << "\n";
     }
 
     cudaFree(spheres);
