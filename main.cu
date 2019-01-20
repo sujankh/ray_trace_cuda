@@ -21,6 +21,12 @@ struct material
     // TODO: properties like phong exponent, specular coeffecient etc
 };
 
+struct light_source
+{
+    vec3 position;
+    vec3 intensity;
+};
+
 struct image_plane
 {
     int l, r; // Left, right edges of the image plane in 3D world
@@ -33,6 +39,7 @@ struct hit_info
 {
     sphere *obj;
     float t;
+    vec3 hit_point;  // Point in surface of obj where the ray hits
 };
 
 
@@ -48,6 +55,8 @@ struct scene
 
     image_plane image;
     vec3 camera;
+    light_source light;
+    light_source ambient;
 };
 
 
@@ -108,12 +117,19 @@ __device__ vec3 ray_at_pixel(int i, int j, image_plane &image)
 
     // Ray from camera towards the pixel (negative w for the direction)
     // Right handed co-ordinate system u,v,w
-    return vec3(u, v, -1 * image.distance);
+    vec3 ray = vec3(u, v, -1 * image.distance);
+    ray.make_unit_vector();
+    return ray;
 }
 
 __device__ vec3 surface_color(scene *scene, hit_info *hit)
 {
-    return hit->obj->m.color;
+    vec3 normal = hit->obj->normal(hit->hit_point);
+    vec3 light_ray = unit_vector(scene->light.position - hit->hit_point); // vec(AB) = B - A
+
+    vec3 color = scene->ambient.intensity * hit->obj->m.color + hit->obj->m.color * scene->light.intensity * fmaxf(0, dot(normal, light_ray));
+
+    return vec3(fminf(color.r(), 255), fminf(color.g(), 255), fminf(color.b(), 255));
 }
 
 __global__ void compute_pixel_color(vec2* data, vec3* frame_buffer, scene *sc)
@@ -159,6 +175,7 @@ __global__ void compute_pixel_color(vec2* data, vec3* frame_buffer, scene *sc)
 
         if(any_hit)
         {
+            nearest_hit.hit_point = sc->camera + t * ray; // p(t) = e + t*d  d = ray, e=camera
             pix_color = surface_color(sc, &nearest_hit);
         }
         frame_buffer[index] = pix_color;
@@ -168,6 +185,7 @@ __global__ void compute_pixel_color(vec2* data, vec3* frame_buffer, scene *sc)
         printf("Index %d is out of bounds", index);
     }
 }
+
 
 int main(void)
 {
@@ -197,15 +215,15 @@ int main(void)
     sphere* spheres;
     cudaMallocManaged(&spheres, num_objects * sizeof(sphere));
 
-    spheres[0] = sphere(vec3(-2, 0, -10), 1);
-    spheres[0].m.color = vec3(255, 0, 0);
+    spheres[0] = sphere(vec3(-4, 0, -10), 1.2);
+    spheres[0].m.color = vec3(220, 0, 0);
 
-    spheres[1] = sphere(vec3(2, 0, -10), 1);
-    spheres[1].m.color = vec3(0, 255, 0);
+    spheres[1] = sphere(vec3(3, 0, -10), 1.4);
+    spheres[1].m.color = vec3(0, 220, 0);
 
     // This sphere is slightly hidden behind the 2nd sphere
-    spheres[2] = sphere(vec3(1.5, 0, -12), 1);
-    spheres[2].m.color = vec3(0, 0, 255);
+    spheres[2] = sphere(vec3(2, 0, -12), 1.5);
+    spheres[2].m.color = vec3(0, 0, 220);
 
     image_plane image;
     image.l = -4; image.r = 4;
@@ -215,12 +233,17 @@ int main(void)
 
     scene *sc;
     cudaMallocManaged(&sc, sizeof(scene));
-    sc->background = vec3(255, 255, 255);
+    sc->background = vec3(120, 120, 120);
     sc->world = spheres;
     sc->num_objects = num_objects;
     sc->camera = vec3(0, 0, 0);
     sc->image = image;
 
+    sc->light.position = vec3(-6, 4, -4);
+    // Limiting the intensity of lights for now because of PPM being configured to have
+    // a max value of 255 for a pixel color (else the values would exceed 255)
+    sc->light.intensity = vec3(1, 1, 1);
+    sc->ambient.intensity = vec3(0.06, 0.06, 0.06);
 
     compute_pixel_color<<<num_blocks, threads_per_block>>>(data, frame_buffer, sc);
     cudaDeviceSynchronize();
@@ -229,11 +252,13 @@ int main(void)
     if(error!=cudaSuccess)
     {
         fprintf(stderr,"ERROR: %s\n", cudaGetErrorString(error) );
+        return 0;
     }
+
     std::cout << "P3\n" << nx << " " << ny << "\n255\n";
     for (int i = 0; i < num_pixels; ++i)
     {
-        std::cout << frame_buffer[i].r() << " " << frame_buffer[i].g() << " " << frame_buffer[i].b() << "\n";
+        std::cout << static_cast<int>(frame_buffer[i].r()) << " " << static_cast<int>(frame_buffer[i].g()) << " " << static_cast<int>(frame_buffer[i].b()) << "\n";
     }
 
     cudaFree(spheres);
