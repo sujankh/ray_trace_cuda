@@ -43,28 +43,31 @@ struct image_plane
 
 struct hit_info
 {
-    sphere *obj;
+    const sphere *obj;
     float t;
     vec3 hit_point;  // Point in surface of obj where the ray hits
 };
 
 
-struct scene
+//
+// Represents a ray p(t) = e + t * d
+// where e = origin of the ray
+// and d = direction of the ray
+//
+struct ray
 {
-    // The world is a list of spheres for now
-    // There are some issues in CUDA with polymorphic types
-    // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#virtual-functions
-    // Refer to branch renderable_abstract_class for more details
-    sphere* world;
-    int num_objects;
-    vec3 background;
+    vec3 d; // direction
+    vec3 e; // origin of the ray
 
-    image_plane image;
-    vec3 camera;
-    light_source light;
-    light_source ambient;
+    //
+    // Get the point in the ray at parametric value t
+    //
+    __host__ __device__
+    vec3 get_point(float t) const
+    {
+        return e + t * d;
+    }
 };
-
 
 struct sphere
 {
@@ -76,7 +79,11 @@ struct sphere
     float R; // radius
     material m;
 
-    __device__ bool hits(vec3 d, scene* scene, hit_info* hit)
+    //
+    // Returns if the ray hits an object in the scene
+    // Updates at what value of t, the ray hits this object
+    //
+    __device__ bool hits(const ray& r, hit_info* hit) const
     {
         // Value of t for a parametric representation of the ray p(t) = e + td
         // where vectors e = camera, d = ray
@@ -85,9 +92,9 @@ struct sphere
         // t` = -d . (e-c) +- sqrt((d.(e-c))^2 - (d.d) ((e-c).(e-c) - R*2))
         // t = t`/(d.d)
 
-        vec3 ce = scene->camera - center;
-        float d_d = dot(d, d);
-        float d_ce = dot(d, ce);
+        vec3 ce = r.e - center;
+        float d_d = dot(r.d, r.d);
+        float d_ce = dot(r.d, ce);
 
         float discriminant = d_ce * d_ce - d_d * (dot(ce, ce) - R * R);
         if(discriminant >= 0)
@@ -107,7 +114,10 @@ struct sphere
         }
     }
 
-    __device__ vec3 normal(vec3 point)
+    //
+    // Compute the normal on the surface at the given point
+    //
+    __device__ vec3 normal(vec3 point) const
     {
         // Expecting point to always be on the surface of the sphere
         return (point - center) / R;
@@ -116,29 +126,112 @@ struct sphere
 };
 
 
-__device__ vec3 ray_at_pixel(int i, int j, image_plane &image)
+struct scene
+{
+    // The world is a list of spheres for now
+    // There are some issues in CUDA with polymorphic types
+    // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#virtual-functions
+    // Refer to branch renderable_abstract_class for more details
+    sphere* world;
+    int num_objects;
+    vec3 background;
+
+    image_plane image;
+    vec3 camera;
+    light_source light;
+    light_source ambient;
+
+    //
+    // Returns if the ray hits an object in the scene
+    // Updates the information about the object in nearest_hit if provided
+    //
+    __device__
+    bool hit(const ray &r, hit_info *nearest_hit)
+    {
+        float t = 1000000000;
+        bool any_hit = false;
+
+        // Check if the ray from the pixel hits any objects in the world
+        for (int k = 0; k < num_objects; k++)
+        {
+            const sphere &obj= world[k];
+            hit_info hit;
+
+            // Get the nearest object which the ray p(t) = e + td hits
+            // The smaller the value of t, the nearest the object is to the image_plane
+            if(obj.hits(r, &hit))
+            {
+                // If the ray hits the object from which it originates(t = 0) or behind the object (t < 0),
+                // we do not want to consider such cases
+                if(hit.t <= 0)
+                {
+                    continue;
+                }
+
+                any_hit = true;
+                if(nearest_hit == nullptr)
+                {
+                    // User just want to know if any object is hit
+                    break;
+                }
+
+                if(hit.t < t)
+                {
+                    t = hit.t;
+                    *nearest_hit = hit;
+                }
+            }
+        }
+
+        return any_hit;
+    }
+};
+
+
+//
+// Compute the ray passing through the camera and the pixel's center
+// Pixel's position specified by (i, j)
+//
+__device__
+ray ray_at_pixel(int i, int j, const image_plane &image, const vec3& camera)
 {
     float u = image.l + (image.r - image.l) * (i + 0.5)/image.nx;
     float v = image.b + (image.t - image.b) * (j + 0.5)/image.ny;
 
     // Ray from camera towards the pixel (negative w for the direction)
     // Right handed co-ordinate system u,v,w
-    vec3 ray = vec3(u, v, -1 * image.distance);
-    ray.make_unit_vector();
-    return ray;
+    ray camera_ray;
+    camera_ray.d = unit_vector(vec3(u, v, -1 * image.distance));
+    camera_ray.e = camera; // The ray originated from the camera
+    return camera_ray;
 }
 
+
+//
+// Compute the color of the pixel at the point where the ray hits the object
+//
 __device__ vec3 surface_color(scene *scene, hit_info *hit)
 {
     vec3 normal = hit->obj->normal(hit->hit_point);
-    vec3 light_ray = unit_vector(scene->light.position - hit->hit_point); // vec(AB) = B - A
+    ray light_ray;
+    light_ray.e = hit->hit_point;
+    light_ray.d = unit_vector(scene->light.position - hit->hit_point); // vec(AB) = B - A
 
     // Use ambient + lambertian shading model: L = ka * Ia + kd * I * max(0, n.l)
-    vec3 color = scene->ambient.intensity * hit->obj->m.color + hit->obj->m.color * scene->light.intensity * fmaxf(0, dot(normal, light_ray));
+    vec3 color = scene->ambient.intensity * hit->obj->m.color;
+
+    if(scene->hit(light_ray, nullptr) == false)  // light ray should not hit any object in the scene for full color
+    {
+        color += hit->obj->m.color * scene->light.intensity * fmaxf(0, dot(normal, light_ray.d));
+    }
+
     return color;
 }
 
-__global__ void compute_pixel_color(vec2* data, vec3* frame_buffer, scene *sc)
+//
+// Main kernel: traces a ray into the scene for a pixel specified by thread ID
+//
+__global__ void trace_ray(vec2* data, vec3* frame_buffer, scene *sc)
 {
     int thread_row = blockIdx.y * blockDim.y + threadIdx.y;
     int thread_col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -153,35 +246,14 @@ __global__ void compute_pixel_color(vec2* data, vec3* frame_buffer, scene *sc)
         int i  = data[index].x;
         int j = data[index].y;
 
-        vec3 ray = ray_at_pixel(i, j, sc->image);
+        const ray& camera_ray = ray_at_pixel(i, j, sc->image, sc->camera);
         vec3 pix_color = sc->background;
 
-        float t = 1000000000;
         hit_info nearest_hit;
-        bool any_hit = false;
 
-        // Check if the ray from the pixel hits any objects in the world
-        for (int k = 0; k < sc->num_objects; k++)
+        if(sc->hit(camera_ray, &nearest_hit))
         {
-            sphere* obj= &sc->world[k];
-            hit_info hit;
-
-            // Get the nearest object which the ray p(t) = e + td hits
-            // The smaller the value of t, the nearest the object is to the image_plane
-            if(obj->hits(ray, sc, &hit))
-            {
-                if(hit.t < t)
-                {
-                    t = hit.t;
-                    nearest_hit = hit;
-                    any_hit = true;
-                }
-            }
-        }
-
-        if(any_hit)
-        {
-            nearest_hit.hit_point = sc->camera + t * ray; // p(t) = e + t*d  d = ray, e=camera
+            nearest_hit.hit_point = camera_ray.get_point(nearest_hit.t);
             pix_color = surface_color(sc, &nearest_hit);
         }
         frame_buffer[index] = pix_color;
@@ -193,7 +265,7 @@ __global__ void compute_pixel_color(vec2* data, vec3* frame_buffer, scene *sc)
 }
 
 
-// Unary reduction op to get the max value of either r/g/b
+// Unary reduction op to get the max value of either r/g/b for a vec3
 struct max_color
 {
     __host__ __device__
@@ -242,19 +314,24 @@ int main(void)
         }
     }
 
-    int num_objects = 3;
+    int num_objects = 4;
     sphere* spheres;
     cudaMallocManaged(&spheres, num_objects * sizeof(sphere));
 
-    spheres[0] = sphere(vec3(-4, 0, -10), 1.2);
+    spheres[0] = sphere(vec3(-4, 1, -10), 1.2);
     spheres[0].m.color = vec3(0.9, 0, 0);
 
-    spheres[1] = sphere(vec3(3, 0, -10), 1.4);
-    spheres[1].m.color = vec3(0, 0.9, 0);
+    spheres[1] = sphere(vec3(3.5, 0, -10), 1.4);
+    spheres[1].m.color = vec3(0.8, 0.8, 0.8);
 
     // This sphere is slightly hidden behind the 2nd sphere
     spheres[2] = sphere(vec3(2, 0, -12), 1.5);
-    spheres[2].m.color = vec3(0, 0, 0.9);
+    spheres[2].m.color = vec3(0, 0.6, 0);
+
+    // Render a base surface as a big sphere
+    // TODO: draw a plane instead
+    spheres[3] = sphere(vec3(0, -84, -50), 90);
+    spheres[3].m.color = vec3(0.7, 0.7, 0.7);
 
     image_plane image;
     image.l = -4; image.r = 4;
@@ -264,17 +341,17 @@ int main(void)
 
     scene *sc;
     cudaMallocManaged(&sc, sizeof(scene));
-    sc->background = vec3(0.4, 0.4, 0.4);
+    sc->background = vec3(0.1, 0.1, 0.1);
     sc->world = spheres;
     sc->num_objects = num_objects;
     sc->camera = vec3(0, 0, 0);
     sc->image = image;
 
-    sc->light.position = vec3(-6, 4, -4);
+    sc->light.position = vec3(-20, 10, -4);
     sc->light.intensity = vec3(1, 1, 1);
     sc->ambient.intensity = vec3(0.3, 0.3, 0.3);
 
-    compute_pixel_color<<<num_blocks, threads_per_block>>>(data, frame_buffer, sc);
+    trace_ray<<<num_blocks, threads_per_block>>>(data, frame_buffer, sc);
     cudaDeviceSynchronize();
 
     cudaError_t error = cudaGetLastError();
